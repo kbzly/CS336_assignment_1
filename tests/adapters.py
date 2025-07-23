@@ -9,6 +9,10 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from cs336_basics.tokenizer import BPETokenizer, train_bpe, BPETokenizerParams
 
 
 def run_linear(
@@ -558,7 +562,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    params = BPETokenizerParams(vocab, merges, special_tokens)
+    return BPETokenizer(params)
 
 
 def run_train_bpe(

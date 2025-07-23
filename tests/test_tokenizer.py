@@ -221,10 +221,11 @@ def test_roundtrip_unicode_string_with_special_tokens():
         vocab_path=VOCAB_PATH, merges_path=MERGES_PATH, special_tokens=["<|endoftext|>"]
     )
     test_string = "Héllò hôw <|endoftext|><|endoftext|> are ü? 🙃<|endoftext|>"
-    encoded_ids = tokenizer.encode(test_string)
-    tokenized_string = [tokenizer.decode([x]) for x in encoded_ids]
+    encoded_ids = tokenizer.encode(test_string) 
+    tokenized_string = tokenizer.decode(encoded_ids) # 这里改过单个token id对应的bytes不保证是utf-8编码
     # Ensure the special <|endoftext|> token is preserved
     assert tokenized_string.count("<|endoftext|>") == 3
+
 
     decoded_string = tokenizer.decode(encoded_ids)
     assert test_string == decoded_string
@@ -342,6 +343,13 @@ def test_tinystories_matches_tiktoken():
         corpus_contents = f.read()
     reference_ids = reference_tokenizer.encode(corpus_contents, allowed_special={"<|endoftext|>"})
     ids = tokenizer.encode(corpus_contents)
+
+    with open("debug_tokenizer_decode.txt", "w", encoding="utf-8") as f:
+        f.write(tokenizer.decode(ids))
+    
+    for i, (id, ref_id) in enumerate(zip(ids, reference_ids)):
+        print(i, id, ref_id)
+
     assert ids == reference_ids
 
     assert tokenizer.decode(ids) == corpus_contents
@@ -358,6 +366,8 @@ def test_encode_special_token_trailing_newlines():
         corpus_contents = f.read()
     reference_ids = reference_tokenizer.encode(corpus_contents, allowed_special={"<|endoftext|>"})
     ids = tokenizer.encode(corpus_contents)
+    for i, (id, ref_id) in enumerate(zip(ids, reference_ids)):
+        print(i, id, ref_id)
     assert ids == reference_ids
 
     assert tokenizer.decode(ids) == corpus_contents
@@ -374,6 +384,8 @@ def test_encode_special_token_double_newline_non_whitespace():
         corpus_contents = f.read()
     reference_ids = reference_tokenizer.encode(corpus_contents, allowed_special={"<|endoftext|>"})
     ids = tokenizer.encode(corpus_contents)
+    for i, (id, ref_id) in enumerate(zip(ids, reference_ids)):
+        print(i, id, ref_id)
     assert ids == reference_ids
 
     assert tokenizer.decode(ids) == corpus_contents
