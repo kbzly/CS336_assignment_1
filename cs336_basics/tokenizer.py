@@ -1,8 +1,12 @@
 from abc import ABC
+from ctypes import addressof
+import os
 from dataclasses import dataclass
 from typing import Union
 from collections import defaultdict
 import regex as re
+from .pretokenization import find_chunk_boundaries
+from multiprocessing import Pool
 
 # 实现一个分词器基类，让BPE继承它
 
@@ -100,21 +104,28 @@ class BPETokenizer(Tokenizer):
                 tokens.extend(self.vocab_lookup[b] for b in byte_list)
 
         return tokens
-
-        # byte_seq = text.encode("utf-8")
-        # byte_list = [bytes([b]) for b in byte_seq]
-
-        # for pair in self.params.merges:
-        #     byte_list = merge_bytes(byte_list, pair)
-
-        # # 将byte_list转换为int list
-        # indices = [self.vocab_lookup[b] for b in byte_list]
-        # return indices
     
     def decode(self, indices: list[int]) -> str:
         bytes_list = list(map(self.params.vocab.get, indices))
         string = b"".join(bytes_list).decode("utf-8")
         return string
+    
+def lexicographically_greater_pair(freq_dict: dict[tuple[int, ...], int], vocab: dict[int, bytes]) -> tuple[int, int]:
+    max_freq = max(freq_dict.values())
+
+    # 获取所有频率最大 pair，对应的 byte 形式
+    candidates = [(vocab[pair[0]], vocab[pair[1]]) for pair, freq in freq_dict.items() if freq == max_freq]
+
+    # 选出字典序最大的
+    max_pair = max(candidates)
+
+    # 构建反向映射
+    inv_vocab = {v: k for k, v in vocab.items()}
+
+    # 转回 index
+    max_pair_index = (inv_vocab[max_pair[0]], inv_vocab[max_pair[1]])
+    return max_pair_index
+
 
 def gpt2_pretokenize_to_freq_dict(text: Union[str, list[str]]) -> dict[tuple[int], int]:
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -130,54 +141,101 @@ def gpt2_pretokenize_to_freq_dict(text: Union[str, list[str]]) -> dict[tuple[int
                 freq_dict[tuple(segment.encode("utf-8"))] += 1
     return freq_dict
 
-def train_bpe(data: Union[str, dict[tuple[int, ...], int]], num_merges: int, special_tokens: list[str]=None) -> BPETokenizerParams:
+def gpt2_pretokenize_to_freq_dict_without_space(text: Union[str, list[str]]) -> dict[tuple[int], int]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)|\p{L}+|\p{N}+|[^\s\p{L}\p{N}]+"""
+    freq_dict = defaultdict(int)
+    if isinstance(text, str):
+        segments = re.findall(PAT, text)
+        for segment in segments:
+            freq_dict[tuple(segment.encode("utf-8"))] += 1
+    elif isinstance(text, list):
+        for t in text:
+            segments = re.findall(PAT, t)
+            for segment in segments:
+                freq_dict[tuple(segment.encode("utf-8"))] += 1
+    return freq_dict
+
+def split_and_remove_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+    """
+    从 text 中用 special_tokens 做分割，返回分割后的 list[str]，
+    每一段都是原始文本的一部分，保留空格和格式，不包含特殊 token。
+    """
+    # 构建正则模式，匹配所有特殊 token
+    pattern = "|".join(re.escape(tok) for tok in special_tokens)
+    # 分割并返回（保留空格，去掉特殊 token 本身）
+    return [part for part in re.split(pattern, text) if part != ""]
+
+
+def process_chunk(args: tuple[str, list[str], int, int]) -> dict[tuple[int], int]:
+    text, special_tokens, start, end = args
+    with open(text, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore") # 用str做正则
+    # 处理特殊符号
+    if special_tokens:
+        chunk = split_and_remove_special_tokens(chunk, special_tokens)
+    return gpt2_pretokenize_to_freq_dict(chunk)
+
+def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str], **kwargs,) -> BPETokenizerParams:
     # 改进版本是不再操作原文本，而是操作一个哈希表，key是被特殊符号处理分割过的单词（还没登记到词表），value是该单词的频率
     # 这种方法把时间复杂度从 O(total byte) 降为 O(unique tokens)，对于大规模的文本数据，只要做好管理存储，也很便于维护新数据
     # 0. 初始化词表
-    vocab = {i: bytes([i]) for i in range(256)}
-    merges = list()
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    merges: list[tuple[bytes, bytes]] = list()
 
-    # 1. 预处理特殊符号，得到哈希表，函数设计成可接受str或者哈希表
-    if isinstance(data, str):
-        data = gpt2_pretokenize_to_freq_dict(data)
+    # 1.读取文件，处理边界
+    with open(input_path, "rb") as f:
+        chunk_boundaries = find_chunk_boundaries(f, desired_num_chunks=4, split_special_token=b"<|endoftext|>" if special_tokens else None)
+    
+    # 2. 多进程处理
+    chunk_args = [(input_path, special_tokens, start, end) for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])]  
+    with Pool(processes=4) as pool:
+        results = pool.map(process_chunk, chunk_args)
+    
+    # 3. 合并结果，之后只操作哈希表
+    data = defaultdict(int)
+    for result in results:
+        for token, freq in result.items():
+            data[token] += freq
 
+    # 4. 训练BPE
+    num_merges = vocab_size - len(vocab) - len(special_tokens) # 目标词表大小减去初始字符数量和特殊符号数量
     while len(merges) < num_merges:
-        # 2. 计算词频
+        # 4.1 计算词频
         freq_dict = defaultdict(int)
         for token, freq in data.items():
             for i in range(len(token) - 1):
                 pair = (token[i], token[i + 1])
                 freq_dict[pair] += freq
-        
-        # preferring the lexicographically greater pair
-        max_pair = max(freq_dict.items(), key=lambda x: (x[1], x[0]))[0]
-        # 更新merges
-        merges.append([vocab[max_pair[0]], vocab[max_pair[1]]])
 
-        # 3. 哈希表key
+        # preferring the lexicographically greater pair
+        # print_freq_choice(freq_dict, len(merges), vocab)
+        max_pair = lexicographically_greater_pair(freq_dict, vocab)
+        # print(vocab[max_pair[0]], vocab[max_pair[1]])
+        # 更新merges
+        merges.append((vocab[max_pair[0]], vocab[max_pair[1]]))
+        
+        # 4.2 更新哈希表key
         new_data = defaultdict(int)
         for token, freq in data.items():
             new_token = merge(token, max_pair, len(vocab))
             new_data[tuple(new_token)] += freq
         data = new_data
 
-        # 4. 更新词表
+        # 4.3 更新词表
         vocab[len(vocab)] = vocab[max_pair[0]] + vocab[max_pair[1]]
+
+    # 5. 补齐vocab里的特殊符号
+    for special_token in special_tokens:
+        vocab[len(vocab)] = special_token.encode("utf-8")
 
     return BPETokenizerParams(vocab, merges, special_tokens)
     
 
 if __name__ == "__main__":
+    address = "/home/wyx/my_project/cs336/assignment1-basics/tests/fixtures/tinystories_sample.txt"
+    tokenizer = BPETokenizer(train_bpe(address, 500, special_tokens=["<|endoftext|>"]))
+    print(tokenizer.params.merges)
     text = "low low low low low lower lower widest widest widest newest newest newest newest newest newest"
-    data = gpt2_pretokenize_to_freq_dict(text)
-    print(train_bpe(data, 15))
-    tokenizer = BPETokenizer(train_bpe(data, 15))
-    print(tokenizer.encode(text))
-    print(tokenizer.decode(tokenizer.encode(text)))
-    assert tokenizer.decode(tokenizer.encode(text)) == text
-
-    # test 1 empty string
-    test_string = ""
-    encoded_ids = tokenizer.encode(test_string)
-    decoded_string = tokenizer.decode(encoded_ids)
-    assert test_string == decoded_string
+    encode_ids = tokenizer.encode(text)
+    assert text == tokenizer.decode(encode_ids)
