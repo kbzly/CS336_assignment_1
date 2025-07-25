@@ -7,6 +7,7 @@ from collections import defaultdict
 import regex as re
 from .pretokenization import find_chunk_boundaries
 from multiprocessing import Pool
+from multiprocessing.dummy import Pool as ThreadPool
 
 # 实现一个分词器基类，让BPE继承它
 
@@ -31,6 +32,15 @@ class BPETokenizerParams:
     merges: list[tuple[bytes, bytes]]
     special_tokens: list[str]
 
+def match_max_pair(token: tuple[bytes], max_pair: tuple[bytes, bytes]) -> bool:
+    i = 0
+    a, b = max_pair
+    while i < len(token) - 1:
+        if a == token[i] and b == token[i + 1]:
+            return True
+        i += 1
+    return False
+
 def merge(indices: list[int], pair: tuple[int, int], new_index: int) -> list[int]:
     """Merge the pair of indices into a new index"""
     new_indices = []
@@ -50,13 +60,15 @@ def merge_bytes(byte_tuple: tuple[bytes], pair: tuple[bytes, bytes]) -> tuple[by
         # 遍历当前byte_list所有相邻词元，如果是pair，那就合并为新的bytes
         new_tuple: list[bytes] = []
         i = 0
+        a, b = pair
         while i < len(byte_tuple) - 1:
-            current_pair = (byte_tuple[i], byte_tuple[i + 1])
-            if current_pair == pair:
-                new_tuple.append(byte_tuple[i] + byte_tuple[i + 1])
+            cur = byte_tuple[i]
+            nxt = byte_tuple[i + 1]
+            if cur == a and nxt == b:
+                new_tuple.append(cur + nxt)
                 i += 2
             else:
-                new_tuple.append(byte_tuple[i])
+                new_tuple.append(cur)
                 i += 1
         if i == len(byte_tuple) - 1: # 如果最后两个词元匹配了pair，i就会等于len(indices),不会进入if语句
             new_tuple.append(byte_tuple[i])
@@ -159,11 +171,11 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
 
     # 1.读取文件，处理边界
     with open(input_path, "rb") as f:
-        chunk_boundaries = find_chunk_boundaries(f, desired_num_chunks=4, split_special_token=b"<|endoftext|>" if special_tokens else None)
+        chunk_boundaries = find_chunk_boundaries(f, desired_num_chunks=8, split_special_token=b"<|endoftext|>" if special_tokens else None)
     
     # 2. 多进程处理
     chunk_args = [(input_path, special_tokens, start, end) for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])]  
-    with Pool(processes=4) as pool:
+    with Pool(processes=8) as pool:
         results = pool.map(process_chunk, chunk_args) # 返回一个list，每个元素是dict[bytes, int]
     
     # 3. 合并结果，之后只操作哈希表
@@ -183,18 +195,22 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
                 freq_dict[pair] += freq
         # preferring the lexicographically greater pair
         max_pair = lexicographically_greater_pair(freq_dict)
-        # 更新merges
-        merges.append(max_pair)
-        
-        # 4.2 更新哈希表key
-        new_data: defaultdict[tuple[bytes], int] = defaultdict(int)
-        for token, freq in data.items():
-            new_token = merge_bytes(token, max_pair)
-            new_data[new_token] += freq
-        data = new_data
 
-        # 4.3 更新词表
+        # 4.2 更新merges和词表
+        merges.append(max_pair)
         vocab[len(vocab)] = max_pair[0] + max_pair[1]
+        
+        # 4.3 更新哈希表key，只处理包含max_pair的token
+        tokens_to_update = []
+        for token, freq in data.items():
+            if match_max_pair(token, max_pair):
+                tokens_to_update.append(token)
+        
+        for token in tokens_to_update:
+            freq = data[token]
+            new_token = merge_bytes(token, max_pair)
+            data[new_token] += freq
+            del data[token]
 
     # 5. 补齐vocab里的特殊符号
     for special_token in special_tokens:
