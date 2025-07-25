@@ -46,21 +46,21 @@ def merge(indices: list[int], pair: tuple[int, int], new_index: int) -> list[int
         new_indices.append(indices[i])
     return new_indices
 
-def merge_bytes(byte_list: list[bytes], pair: tuple[bytes, bytes]) -> list[bytes]:
-        """Merge the pair of indices into a new index"""
+def merge_bytes(byte_tuple: tuple[bytes], pair: tuple[bytes, bytes]) -> tuple[bytes]:
         # 遍历当前byte_list所有相邻词元，如果是pair，那就合并为新的bytes
-        new_list = []
+        new_tuple: list[bytes] = []
         i = 0
-        while i < len(byte_list) - 1:
-            if (byte_list[i], byte_list[i + 1]) == pair:
-                new_list.append(byte_list[i] + byte_list[i + 1])
+        while i < len(byte_tuple) - 1:
+            current_pair = (byte_tuple[i], byte_tuple[i + 1])
+            if current_pair == pair:
+                new_tuple.append(byte_tuple[i] + byte_tuple[i + 1])
                 i += 2
             else:
-                new_list.append(byte_list[i])
+                new_tuple.append(byte_tuple[i])
                 i += 1
-        if i == len(byte_list) - 1: # 如果最后两个词元匹配了pair，i就会等于len(indices),不会进入if语句
-            new_list.append(byte_list[i])
-        return new_list
+        if i == len(byte_tuple) - 1: # 如果最后两个词元匹配了pair，i就会等于len(indices),不会进入if语句
+            new_tuple.append(byte_tuple[i])
+        return tuple(new_tuple)
 
 # 实现一个BPE分词器
 class BPETokenizer(Tokenizer):
@@ -110,49 +110,23 @@ class BPETokenizer(Tokenizer):
         string = b"".join(bytes_list).decode("utf-8")
         return string
     
-def lexicographically_greater_pair(freq_dict: dict[tuple[int, ...], int], vocab: dict[int, bytes]) -> tuple[int, int]:
-    max_freq = max(freq_dict.values())
-
-    # 获取所有频率最大 pair，对应的 byte 形式
-    candidates = [(vocab[pair[0]], vocab[pair[1]]) for pair, freq in freq_dict.items() if freq == max_freq]
-
-    # 选出字典序最大的
-    max_pair = max(candidates)
-
-    # 构建反向映射
-    inv_vocab = {v: k for k, v in vocab.items()}
-
-    # 转回 index
-    max_pair_index = (inv_vocab[max_pair[0]], inv_vocab[max_pair[1]])
-    return max_pair_index
+def lexicographically_greater_pair(freq_dict: dict[tuple[bytes, bytes], int]) -> tuple[bytes, bytes]:
+    max_pair = max(freq_dict.items(), key=lambda x: (x[1], x[0]))[0]
+    return max_pair
 
 
-def gpt2_pretokenize_to_freq_dict(text: Union[str, list[str]]) -> dict[tuple[int], int]:
+def gpt2_pretokenize_to_freq_dict(text: Union[str, list[str]]) -> dict[bytes, int]:
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     freq_dict = defaultdict(int)
     if isinstance(text, str):
         segments = re.findall(PAT, text)
         for segment in segments:
-            freq_dict[tuple(segment.encode("utf-8"))] += 1
+            freq_dict[segment.encode("utf-8")] += 1
     elif isinstance(text, list):
         for t in text:
             segments = re.findall(PAT, t)
             for segment in segments:
-                freq_dict[tuple(segment.encode("utf-8"))] += 1
-    return freq_dict
-
-def gpt2_pretokenize_to_freq_dict_without_space(text: Union[str, list[str]]) -> dict[tuple[int], int]:
-    PAT = r"""'(?:[sdmt]|ll|ve|re)|\p{L}+|\p{N}+|[^\s\p{L}\p{N}]+"""
-    freq_dict = defaultdict(int)
-    if isinstance(text, str):
-        segments = re.findall(PAT, text)
-        for segment in segments:
-            freq_dict[tuple(segment.encode("utf-8"))] += 1
-    elif isinstance(text, list):
-        for t in text:
-            segments = re.findall(PAT, t)
-            for segment in segments:
-                freq_dict[tuple(segment.encode("utf-8"))] += 1
+                freq_dict[segment.encode("utf-8")] += 1
     return freq_dict
 
 def split_and_remove_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
@@ -166,7 +140,7 @@ def split_and_remove_special_tokens(text: str, special_tokens: list[str]) -> lis
     return [part for part in re.split(pattern, text) if part != ""]
 
 
-def process_chunk(args: tuple[str, list[str], int, int]) -> dict[tuple[int], int]:
+def process_chunk(args: tuple[str, list[str], int, int]) -> dict[bytes, int]:
     text, special_tokens, start, end = args
     with open(text, "rb") as f:
         f.seek(start)
@@ -190,40 +164,37 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
     # 2. 多进程处理
     chunk_args = [(input_path, special_tokens, start, end) for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])]  
     with Pool(processes=4) as pool:
-        results = pool.map(process_chunk, chunk_args)
+        results = pool.map(process_chunk, chunk_args) # 返回一个list，每个元素是dict[bytes, int]
     
     # 3. 合并结果，之后只操作哈希表
-    data = defaultdict(int)
+    data: defaultdict[tuple[bytes], int] = defaultdict(int) # 哈希表的key是tuple[bytes]，value是频率
     for result in results:
         for token, freq in result.items():
-            data[token] += freq
+            data[tuple([bytes([b]) for b in token])] += freq
 
     # 4. 训练BPE
     num_merges = vocab_size - len(vocab) - len(special_tokens) # 目标词表大小减去初始字符数量和特殊符号数量
     while len(merges) < num_merges:
         # 4.1 计算词频
-        freq_dict = defaultdict(int)
+        freq_dict: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
         for token, freq in data.items():
             for i in range(len(token) - 1):
                 pair = (token[i], token[i + 1])
                 freq_dict[pair] += freq
-
         # preferring the lexicographically greater pair
-        # print_freq_choice(freq_dict, len(merges), vocab)
-        max_pair = lexicographically_greater_pair(freq_dict, vocab)
-        # print(vocab[max_pair[0]], vocab[max_pair[1]])
+        max_pair = lexicographically_greater_pair(freq_dict)
         # 更新merges
-        merges.append((vocab[max_pair[0]], vocab[max_pair[1]]))
+        merges.append(max_pair)
         
         # 4.2 更新哈希表key
-        new_data = defaultdict(int)
+        new_data: defaultdict[tuple[bytes], int] = defaultdict(int)
         for token, freq in data.items():
-            new_token = merge(token, max_pair, len(vocab))
-            new_data[tuple(new_token)] += freq
+            new_token = merge_bytes(token, max_pair)
+            new_data[new_token] += freq
         data = new_data
 
         # 4.3 更新词表
-        vocab[len(vocab)] = vocab[max_pair[0]] + vocab[max_pair[1]]
+        vocab[len(vocab)] = max_pair[0] + max_pair[1]
 
     # 5. 补齐vocab里的特殊符号
     for special_token in special_tokens:
