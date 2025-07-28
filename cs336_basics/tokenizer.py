@@ -1,8 +1,9 @@
 from abc import ABC
 from ctypes import addressof
 import os
+import json
 from dataclasses import dataclass
-from typing import Union
+from typing import Union, Iterable, Iterator
 from collections import defaultdict
 import regex as re
 from .pretokenization import find_chunk_boundaries
@@ -74,29 +75,38 @@ def merge_bytes(byte_tuple: tuple[bytes], pair: tuple[bytes, bytes]) -> tuple[by
             new_tuple.append(byte_tuple[i])
         return tuple(new_tuple)
 
+def split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+    if not special_tokens:
+        return [text]
+
+    # 按长度降序排列，保证正则优先匹配最长
+    pattern = "|".join(sorted(map(re.escape, special_tokens), key=len, reverse=True))
+    return re.split(f"({pattern})", text)
+
+
 # 实现一个BPE分词器
 class BPETokenizer(Tokenizer):
     """Byte-pair encoding tokenizer"""
     def __init__(self, params: BPETokenizerParams):
         self.params = params
         self.vocab_lookup: dict[bytes, int] = {v: k for k, v in self.params.vocab.items()}
+    
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens:list[str] | None = None):
+        with open(vocab_filepath, "rb") as f:
+            vocab = json.load(f)
+        with open(merges_filepath, "rb") as f:
+            merges = json.load(f)
+        return cls(BPETokenizerParams(vocab, merges, special_tokens))
 
     def encode(self, text: str) -> list[int]:
         # 对单个字符的编码任然是uft-8编码
         # 在遍历merges规则时，维护一个int list
         tokens = []
         special_token_set = set(self.params.special_tokens or [])
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         
-        if special_token_set:
-            # 构建正则分割 pattern
-            # 先排序，让最长的特殊符号先被匹配 def test_overlapping_special_tokens()
-            special_pattern = "|".join(
-                re.escape(tok) for tok in sorted(special_token_set, key=len, reverse=True)
-            )
-            pattern = f"({special_pattern})"
-            segments = re.split(pattern, text)
-        else:
-            segments = [text]
+        segments = split_by_special_tokens(text, self.params.special_tokens)
 
         for segment in segments:
             if not segment:
@@ -104,22 +114,30 @@ class BPETokenizer(Tokenizer):
             if segment in special_token_set:
                 byte_token = segment.encode("utf-8")
                 token_id = self.vocab_lookup.get(byte_token)
-                if token_id is None:
-                    raise ValueError(f"Special token {segment} not in vocab")
                 tokens.append(token_id)
             else:
                 # 正常文本走 BPE 编码
-                byte_seq = segment.encode("utf-8")
-                byte_list = [bytes([b]) for b in byte_seq]
-                for pair in self.params.merges:
-                    byte_list = merge_bytes(byte_list, pair)
-                tokens.extend(self.vocab_lookup[b] for b in byte_list)
-
+                # 这里需要再做一遍gpt2正则规则
+                pre_tokens = re.findall(PAT, segment)
+                for pre_token in pre_tokens:
+                    byte_seq = pre_token.encode("utf-8")
+                    byte_list = [bytes([b]) for b in byte_seq]
+                    for pair in self.params.merges:
+                        byte_list = merge_bytes(byte_list, pair)
+                    tokens.extend(self.vocab_lookup[b] for b in byte_list)
         return tokens
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for chunk in iterable:
+            # 逐行 encode
+            token_ids = self.encode(chunk)
+            for token_id in token_ids:
+                yield token_id
+
     
     def decode(self, indices: list[int]) -> str:
         bytes_list = list(map(self.params.vocab.get, indices))
-        string = b"".join(bytes_list).decode("utf-8")
+        string = b"".join(bytes_list).decode("utf-8", errors="replace")
         return string
     
 def lexicographically_greater_pair(freq_dict: dict[tuple[bytes, bytes], int]) -> tuple[bytes, bytes]:

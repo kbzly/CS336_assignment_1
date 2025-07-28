@@ -222,7 +222,17 @@ def test_roundtrip_unicode_string_with_special_tokens():
     )
     test_string = "Héllò hôw <|endoftext|><|endoftext|> are ü? 🙃<|endoftext|>"
     encoded_ids = tokenizer.encode(test_string) 
-    tokenized_string = tokenizer.decode(encoded_ids) # 这里改过单个token id对应的bytes不保证是utf-8编码
+
+    # reference_tokenizer = tiktoken.get_encoding("gpt2")
+    # reference_ids = reference_tokenizer.encode(test_string, allowed_special={"<|endoftext|>"})
+
+    # assert encoded_ids == reference_ids # pass
+    # tokenized_string = [reference_tokenizer.decode([x]) for x in reference_ids] # pass
+
+    # for x in encoded_ids:
+    #     print(reference_tokenizer.decode([x])) # 输出的是乱码，要求是不报错，但是能正确编码sepcial token
+
+    tokenized_string = [tokenizer.decode([x]) for x in encoded_ids]
     # Ensure the special <|endoftext|> token is preserved
     assert tokenized_string.count("<|endoftext|>") == 3
 
@@ -262,6 +272,15 @@ def test_overlapping_special_tokens():
     # Test roundtrip
     assert tokenizer.decode(ids) == test_string
 
+    # reference_tokenizer = tiktoken.get_encoding("gpt2")
+    # test_string2 = "<|endoftext|><|endoftext|><|endoftext|>"
+    # reference_ids = reference_tokenizer.encode(test_string2, allowed_special={"<|endoftext|>"})
+    # ids2 = tokenizer.encode(test_string2)
+    # tokenized_string2 = [tokenizer.decode([x]) for x in ids2]
+    # print(tokenizer.decode([ids2[0]]), tokenizer.decode([ids2[1]]))
+    # print(tokenized_string2.count("<|endoftext|>"))
+    # print(tokenized_string2.count("<|endoftext|><|endoftext|>"))
+    # print(tokenized_string2.count("<|endoftext|><|endoftext|><|endoftext|>"))
 
 def test_address_roundtrip():
     tokenizer = get_tokenizer_from_vocab_merges_path(
@@ -345,7 +364,7 @@ def test_tinystories_matches_tiktoken():
     ids = tokenizer.encode(corpus_contents) 
     # for i, (id, ref_id) in enumerate(zip(ids, reference_ids)):
     #     print(i, id, ref_id)
-    # assert ids == reference_ids
+    assert ids == reference_ids
 
     assert tokenizer.decode(ids) == corpus_contents
     assert reference_tokenizer.decode(reference_ids) == corpus_contents
@@ -361,11 +380,11 @@ def test_encode_special_token_trailing_newlines():
         corpus_contents = f.read()
     reference_ids = reference_tokenizer.encode(corpus_contents, allowed_special={"<|endoftext|>"})
     ids = tokenizer.encode(corpus_contents)
-    for i in range(len(ids)):
-        print(i, ids[i])
-    for i in range(len(reference_ids)):
-        print(i, reference_ids[i])
-    # assert ids == reference_ids
+    # for i in range(len(ids)):
+    #     print(i, ids[i])
+    # for i in range(len(reference_ids)):
+    #     print(i, reference_ids[i])
+    assert ids == reference_ids
 
     assert tokenizer.decode(ids) == corpus_contents
     assert reference_tokenizer.decode(reference_ids) == corpus_contents
@@ -381,11 +400,11 @@ def test_encode_special_token_double_newline_non_whitespace():
         corpus_contents = f.read()
     reference_ids = reference_tokenizer.encode(corpus_contents, allowed_special={"<|endoftext|>"})
     ids = tokenizer.encode(corpus_contents)
-    for i in range(len(ids)):
-        print(i, ids[i])
-    for i in range(len(reference_ids)):
-        print(i, reference_ids[i])
-    # assert ids == reference_ids
+    # for i in range(len(ids)):
+    #     print(i, ids[i])
+    # for i in range(len(reference_ids)):
+    #     print(i, reference_ids[i])
+    assert ids == reference_ids
 
     assert tokenizer.decode(ids) == corpus_contents
     assert reference_tokenizer.decode(reference_ids) == corpus_contents
@@ -453,6 +472,9 @@ def test_encode_memory_usage():
         merges_path=MERGES_PATH,
     )
     with open(FIXTURES_PATH / "tinystories_sample_5M.txt") as f:
+        ids = []
+        # for _id in _encode_iterable(tokenizer, f):
+        #     ids.append(_id)
         contents = f.read()
         _ = _encode(tokenizer, contents)
 
