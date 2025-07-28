@@ -183,17 +183,42 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
     for result in results:
         for token, freq in result.items():
             data[tuple([bytes([b]) for b in token])] += freq
+    
+    data_with_id: dict[tuple[bytes], (int, int)] = {}
+    id_to_token: dict[int, tuple[bytes]] = {}
+    for i, (token, freq) in enumerate(data.items()):
+        data_with_id[token] = (i, freq)
+        id_to_token[i] = token
+    data = data_with_id
+
 
     # 4. 训练BPE
     num_merges = vocab_size - len(vocab) - len(special_tokens) # 目标词表大小减去初始字符数量和特殊符号数量
+
+    # 4.1 计算词频
+    freq_dict: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
+    vocab_to_id: dict[bytes, int] = {}
+
+    for pre_token, (id, freq) in data.items():
+        exist_token: set[bytes] = set()
+        for i in range(len(pre_token) - 1):
+            exist_token.add(pre_token[i])
+            pair = (pre_token[i], pre_token[i + 1])
+            freq_dict[pair] += freq
+        exist_token.add(pre_token[len(pre_token) - 1]) # 加上最后一个词元
+
+        for token in exist_token:
+            # 读取可能存在该token的pretoken，然后修改tuple再加回去
+            # 每个pre_token都不一样，所以不用考虑重复
+            if token in vocab_to_id:
+                tmp = list(vocab_to_id[token])
+                tmp.append(id)
+                vocab_to_id[token] = tuple(tmp)
+            else:
+                vocab_to_id[token] = (id,)
+
     while len(merges) < num_merges:
         # 4.1 计算词频
-        freq_dict: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
-        for token, freq in data.items():
-            for i in range(len(token) - 1):
-                pair = (token[i], token[i + 1])
-                freq_dict[pair] += freq
-        # preferring the lexicographically greater pair
         max_pair = lexicographically_greater_pair(freq_dict)
 
         # 4.2 更新merges和词表
@@ -201,17 +226,54 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
         vocab[len(vocab)] = max_pair[0] + max_pair[1]
         
         # 4.3 更新哈希表key，只处理包含max_pair的token
-        tokens_to_update = []
-        for token, freq in data.items():
-            if match_max_pair(token, max_pair):
-                tokens_to_update.append(token)
-        
-        for token in tokens_to_update:
-            freq = data[token]
-            new_token = merge_bytes(token, max_pair)
-            data[new_token] += freq
-            del data[token]
+        a, b = max_pair
+        candidates = []
+        # candidates应该在vocab_to_id同时出现过
+        id_a = vocab_to_id[a]  # 获取键 a 对应的 int
+        id_b = vocab_to_id[b]  # 获取键 b 对应的 int
 
+        # 转换为集合，以便高效查找交集
+        set_a = set(id_a)
+        set_b = set(id_b)
+
+        # 找出共有的 tuple[bytes]
+        common_ids = set_a & set_b
+
+        # 如果需要结果保持 tuple 类型
+        candidates = tuple(common_ids)
+        
+        for candidate_id in candidates:
+            candidate = id_to_token[candidate_id]
+            freq = data[candidate][1]
+            if match_max_pair(candidate, max_pair):
+                # 尝试merge
+                new_token = merge_bytes(candidate, max_pair)
+
+                # 更新 freq_dict：先移除 candidate 中所有相邻 pair 的频率
+                for i in range(len(candidate) - 1):
+                    freq_dict[(candidate[i], candidate[i+1])] -= freq
+
+                # 更新 freq_dict：再为 new_token 添加新 pair 的频率
+                for i in range(len(new_token) - 1):
+                    freq_dict[(new_token[i], new_token[i+1])] += freq
+
+                # 更新 vocab_to_id
+                if a+b in vocab_to_id:
+                    tmp = list(vocab_to_id[a+b])
+                    tmp.append(candidate_id)
+                    vocab_to_id[a+b] = tuple(tmp)
+                else:
+                    vocab_to_id[a+b] = (candidate_id,)
+                
+                # 更新 id_to_token
+                id_to_token[candidate_id] = new_token
+
+                # 更新 data
+                data[new_token] = (candidate_id, freq)
+                del data[candidate]
+        # 现在我们有更新过后的data，freq_dict，vocab2pretoken
+        # 可以开始下一轮了
+        
     # 5. 补齐vocab里的特殊符号
     for special_token in special_tokens:
         vocab[len(vocab)] = special_token.encode("utf-8")
