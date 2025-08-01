@@ -199,7 +199,8 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    multihead_self_attention_with_rope = MultiheadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len, theta)
+    RoPE = RotaryPositionalEmbedding(d_model // num_heads, theta, max_seq_len)
+    multihead_self_attention_with_rope = MultiheadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len, theta, RoPE)
     multihead_self_attention_with_rope.Q_proj.W.data = q_proj_weight
     multihead_self_attention_with_rope.K_proj.W.data = k_proj_weight
     multihead_self_attention_with_rope.V_proj.W.data = v_proj_weight
@@ -301,9 +302,12 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    transformer_block = TransformerBlock(TransformerBlockConfig(d_model, num_heads, d_ff, max_seq_len, theta))
+    RoPE = RotaryPositionalEmbedding(d_model // num_heads, theta, max_seq_len)
+    transformer_block = TransformerBlock(TransformerBlockConfig(d_model, num_heads, d_ff, max_seq_len, theta, RoPE))
     transformer_block.load_weights_dict(weights)
-    return transformer_block(in_features)
+    token_positions = torch.arange(in_features.shape[-2], device=in_features.device, dtype=torch.long) # shape: (seq_len,)
+    token_positions = token_positions.expand(in_features.shape[:-1]) # (..., seq_len)
+    return transformer_block(in_features, token_positions)
 
 
 def run_transformer_lm(

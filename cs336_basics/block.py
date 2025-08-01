@@ -225,7 +225,8 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         d_model: int,
         num_heads: int,
         max_seq_len: int,
-        theta: float):
+        theta: float,
+        RoPE: RotaryPositionalEmbedding | None = None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -239,8 +240,11 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         self.K_proj = Linear(d_model, self.d_k)
         self.V_proj = Linear(d_model, self.d_v)
         self.O_proj = Linear(self.d_v, d_model)
+        self.RoPE = RoPE
     
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        # print(f"[DEBUG] self.RoPE id: {id(self.RoPE)}")
+        # print(f"[DEBUG] token_positions id: {id(token_positions)}")
         Q = self.Q_proj(x) # (..., seq_len, d_k)
         K = self.K_proj(x) # (..., seq_len, d_k)
         V = self.V_proj(x) # (..., seq_len, d_v)
@@ -250,9 +254,8 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         V = rearrange(V, "... seq_len (num_heads d_head_v) -> ... num_heads seq_len d_head_v", num_heads=self.num_heads)
 
         if token_positions is not None:
-            RoPE = RotaryPositionalEmbedding(self.d_k_head, self.theta, self.max_seq_len)
-            Q = RoPE(Q, token_positions)
-            K = RoPE(K, token_positions)
+            Q = self.RoPE(Q, token_positions)
+            K = self.RoPE(K, token_positions)
 
         mask = build_causal_mask(Q.shape[-2], device=Q.device)
         
@@ -267,6 +270,7 @@ class TransformerBlockConfig:
     d_ff: int
     max_seq_len: int
     theta: float
+    RoPE: RotaryPositionalEmbedding | None = None
 
 class TransformerBlock(nn.Module): # pre-norm
     """
@@ -297,7 +301,8 @@ class TransformerBlock(nn.Module): # pre-norm
             d_model=self.config.d_model,
             num_heads=self.config.num_heads,
             max_seq_len=self.config.max_seq_len,
-            theta=self.config.theta
+            theta=self.config.theta,
+            RoPE=self.config.RoPE
         )
     
     def load_weights_dict(self, weights: dict[str, torch.Tensor]):
@@ -311,12 +316,12 @@ class TransformerBlock(nn.Module): # pre-norm
         self.mha.V_proj.W.data = weights["attn.v_proj.weight"]
         self.mha.O_proj.W.data = weights["attn.output_proj.weight"]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         # token_positions: (..., seq_len)
         # x: (..., seq_len, d_model)
-        token_positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.long) # shape: (seq_len,)
+        # token_positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.long) # shape: (seq_len,)
         # 用expand广播，x: (..., seq_len, d_model), token_positions: (seq_len,)
-        token_positions = token_positions.expand(x.shape[:-1])  # (..., seq_len), (seq_len,)
+        # token_positions = token_positions.expand(x.shape[:-1])  # (..., seq_len), (seq_len,)
         # 或者
         # token_positions = token_positions.unsqueeze(0).expand(x.shape[:-1]) # (..., seq_len), (1, seq_len)
         x = x + self.mha(self.norm1(x), token_positions)
@@ -338,7 +343,8 @@ class TransformerLM(nn.Module):
         super().__init__()
         self.config = config
         self.token_embeddings = Embedding(config.vocab_size, config.d_model)
-        transformer_block_config = TransformerBlockConfig(config.d_model, config.num_heads, config.d_ff, config.context_length, config.rope_theta)
+        RoPE = RotaryPositionalEmbedding(config.d_model // config.num_heads, config.rope_theta, config.context_length)
+        transformer_block_config = TransformerBlockConfig(config.d_model, config.num_heads, config.d_ff, config.context_length, config.rope_theta, RoPE)
         self.layers = nn.ModuleList([TransformerBlock(transformer_block_config) for _ in range(config.num_layers)])
         self.ln_final = RMSNorm(config.d_model)
         self.lm_head = Linear(config.d_model, config.vocab_size)
@@ -353,7 +359,9 @@ class TransformerLM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.token_embeddings(x)
+        token_positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.long) # shape: (seq_len,)
+        token_positions = token_positions.expand(x.shape[:-1]) # (..., seq_len)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, token_positions)
         x = self.ln_final(x)
         return self.lm_head(x)
