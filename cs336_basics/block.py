@@ -1,8 +1,11 @@
+from re import S
 import torch
 from torch import nn
 from torch.nn import init
 import math
 from einops import einsum, reduce, rearrange
+from dataclasses import dataclass
+from .utils import strip_prefix_from_state_dict
 
 class Linear(nn.Module):
     def __init__(
@@ -173,45 +176,40 @@ class MultiheadSelfAttention(nn.Module):
     """
     d_model: int,
     num_heads: int,
-    q_proj_weight: Float[Tensor, " d_k d_in"],
-    k_proj_weight: Float[Tensor, " d_k d_in"],
-    v_proj_weight: Float[Tensor, " d_v d_in"],
-    o_proj_weight: Float[Tensor, " d_model d_v"]
+    assignment1 spec里说dk = dv = d_model/num_heads
+    adapters.py里的注释: (q_proj_weight (Float[Tensor, "d_k d_in"]))， 这里的d_k其实是所以head合的维度
+    统一标准：d_k是所有head合的维度，d_k_head是每个head的维度，有假设d_k_head = d_model/num_heads。d_v同理
     """
     def __init__(self,
         d_model: int,
-        num_heads: int,
-        q_proj_weight: torch.Tensor,
-        k_proj_weight: torch.Tensor,
-        v_proj_weight: torch.Tensor,
-        o_proj_weight: torch.Tensor):
+        num_heads: int,):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
-        self.d_k = q_proj_weight.shape[0]
-        self.d_v = v_proj_weight.shape[0]
+        self.d_k = d_model
+        self.d_k_head = d_model // num_heads
+        self.d_v = d_model
+        self.d_v_head = d_model // num_heads
         self.Q_proj = Linear(d_model, self.d_k)
-        self.Q_proj.W.data = q_proj_weight
         self.K_proj = Linear(d_model, self.d_k)
-        self.K_proj.W.data = k_proj_weight
         self.V_proj = Linear(d_model, self.d_v)
-        self.V_proj.W.data = v_proj_weight
         self.O_proj = Linear(self.d_v, d_model)
-        self.O_proj.W.data = o_proj_weight
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 虽然每个头有不同的参数，也会分别计算attention，但是可以并行计算以加速
         Q = self.Q_proj(x) # (..., seq_len, d_k)
         K = self.K_proj(x) # (..., seq_len, d_k)
         V = self.V_proj(x) # (..., seq_len, d_v)
 
-        Q = rearrange(Q, "... seq_len (h d_head_k) -> ... h seq_len d_head_k", h=self.num_heads)
-        K = rearrange(K, "... seq_len (h d_head_k) -> ... h seq_len d_head_k", h=self.num_heads)
-        V = rearrange(V, "... seq_len (h d_head_v) -> ... h seq_len d_head_v", h=self.num_heads)
+        # mask是在seqence意义的维度上，所以需要rearrange
+        Q = rearrange(Q, "... seq_len (num_heads d_head_k) -> ... num_heads seq_len d_head_k", num_heads=self.num_heads)
+        K = rearrange(K, "... seq_len (num_heads d_head_k) -> ... num_heads seq_len d_head_k", num_heads=self.num_heads)
+        V = rearrange(V, "... seq_len (num_heads d_head_v) -> ... num_heads seq_len d_head_v", num_heads=self.num_heads)
 
         mask = build_causal_mask(Q.shape[-2], device=Q.device)
         
-        attn_output = ScaledDotProductAttention(Q, K, V, mask) # (..., num_heads, seq_len, d_v)
-        attn_output = rearrange(attn_output, "... h seq_len d_head_v -> ... seq_len (h d_head_v)") # (..., seq_len, d_v)
+        attn_output = ScaledDotProductAttention(Q, K, V, mask) # (..., num_heads, seq_len, d_head_v)
+        attn_output = rearrange(attn_output, "... num_heads seq_len d_head_v -> ... seq_len (num_heads d_head_v)") # (..., seq_len, d_v)
         return self.O_proj(attn_output)
 
     
@@ -221,55 +219,141 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
     num_heads: int,
     max_seq_len: int,
     theta: float,
-    q_proj_weight: Float[Tensor, " d_k d_in"],
-    k_proj_weight: Float[Tensor, " d_k d_in"],
-    v_proj_weight: Float[Tensor, " d_v d_in"],
-    o_proj_weight: Float[Tensor, " d_model d_v"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None
     """
     def __init__(self,
         d_model: int,
         num_heads: int,
         max_seq_len: int,
-        theta: float,
-        q_proj_weight: torch.Tensor,
-        k_proj_weight: torch.Tensor,
-        v_proj_weight: torch.Tensor,
-        o_proj_weight: torch.Tensor,
-        token_positions: torch.Tensor | None = None):
+        theta: float):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
-        self.token_positions = token_positions
-        self.d_k = q_proj_weight.shape[0]
-        self.d_v = v_proj_weight.shape[0]
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.d_k = d_model
+        self.d_k_head = d_model // num_heads
+        self.d_v = d_model
+        self.d_v_head = d_model // num_heads
         self.Q_proj = Linear(d_model, self.d_k)
-        self.Q_proj.W.data = q_proj_weight
         self.K_proj = Linear(d_model, self.d_k)
-        self.K_proj.W.data = k_proj_weight
         self.V_proj = Linear(d_model, self.d_v)
-        self.V_proj.W.data = v_proj_weight
         self.O_proj = Linear(self.d_v, d_model)
-        self.O_proj.W.data = o_proj_weight
-
-        if self.token_positions is not None:
-            self.RoPE = RotaryPositionalEmbedding(self.d_k // self.num_heads, theta, max_seq_len)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         Q = self.Q_proj(x) # (..., seq_len, d_k)
         K = self.K_proj(x) # (..., seq_len, d_k)
         V = self.V_proj(x) # (..., seq_len, d_v)
 
-        Q = rearrange(Q, "... seq_len (h d_head_k) -> ... h seq_len d_head_k", h=self.num_heads)
-        K = rearrange(K, "... seq_len (h d_head_k) -> ... h seq_len d_head_k", h=self.num_heads)
-        V = rearrange(V, "... seq_len (h d_head_v) -> ... h seq_len d_head_v", h=self.num_heads)
+        Q = rearrange(Q, "... seq_len (num_heads d_head_k) -> ... num_heads seq_len d_head_k", num_heads=self.num_heads)
+        K = rearrange(K, "... seq_len (num_heads d_head_k) -> ... num_heads seq_len d_head_k", num_heads=self.num_heads)
+        V = rearrange(V, "... seq_len (num_heads d_head_v) -> ... num_heads seq_len d_head_v", num_heads=self.num_heads)
 
-        if self.token_positions is not None:
-            Q = self.RoPE(Q, self.token_positions)
-            K = self.RoPE(K, self.token_positions)
+        if token_positions is not None:
+            RoPE = RotaryPositionalEmbedding(self.d_k_head, self.theta, self.max_seq_len)
+            Q = RoPE(Q, token_positions)
+            K = RoPE(K, token_positions)
 
         mask = build_causal_mask(Q.shape[-2], device=Q.device)
         
         attn_output = ScaledDotProductAttention(Q, K, V, mask) # (..., num_heads, seq_len, d_v)
-        attn_output = rearrange(attn_output, "... h seq_len d_head_v -> ... seq_len (h d_head_v)") # (..., seq_len, d_v)
+        attn_output = rearrange(attn_output, "... num_heads seq_len d_head_v -> ... seq_len (num_heads d_head_v)") # (..., seq_len, d_v)
         return self.O_proj(attn_output)
+
+@dataclass
+class TransformerBlockConfig:
+    d_model: int
+    num_heads: int
+    d_ff: int
+    max_seq_len: int
+    theta: float
+
+class TransformerBlock(nn.Module): # pre-norm
+    """
+    d_model: int Dimensionality of the Transformer block inputs.
+    num_heads: int Number of heads to use in multi-head self-attention.
+    d_ff: int Dimensionality of the position-wise feed-forward inner layer.
+    max_seq_len: int Maximum sequence length.
+    theta: float Theta value for RoPE.
+    weights: dict[str, torch.Tensor] Dictionary of weights for the Transformer block.
+    valid key of weights:
+        attn.q_proj.weight: (d_k, d_in)
+        attn.k_proj.weight: (d_k, d_in)
+        attn.v_proj.weight: (d_v, d_in)
+        attn.output_proj.weight: (d_model, d_v)
+        ln1.weight: (d_model,)
+        ln2.weight: (d_model,)
+        ffn.w1.weight: (d_ff, d_model)
+        ffn.w2.weight: (d_model, d_ff)
+        ffn.w3.weight: (d_ff, d_model)
+    """
+    def __init__(self, config: TransformerBlockConfig):
+        super().__init__()
+        self.config = config
+        self.norm1 = RMSNorm(self.config.d_model)
+        self.norm2 = RMSNorm(self.config.d_model)
+        self.ffn = PositionwiseFeedForward(self.config.d_model, self.config.d_ff)
+        self.mha = MultiheadSelfAttentionWithRoPE(
+            d_model=self.config.d_model,
+            num_heads=self.config.num_heads,
+            max_seq_len=self.config.max_seq_len,
+            theta=self.config.theta
+        )
+    
+    def load_weights_dict(self, weights: dict[str, torch.Tensor]):
+        self.norm1.weight.data = weights["ln1.weight"]
+        self.norm2.weight.data = weights["ln2.weight"]
+        self.ffn.linear1.W.data = weights["ffn.w1.weight"]
+        self.ffn.linear2.W.data = weights["ffn.w2.weight"]
+        self.ffn.linear3.W.data = weights["ffn.w3.weight"]
+        self.mha.Q_proj.W.data = weights["attn.q_proj.weight"]
+        self.mha.K_proj.W.data = weights["attn.k_proj.weight"]
+        self.mha.V_proj.W.data = weights["attn.v_proj.weight"]
+        self.mha.O_proj.W.data = weights["attn.output_proj.weight"]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # token_positions: (..., seq_len)
+        # x: (..., seq_len, d_model)
+        token_positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.long) # shape: (seq_len,)
+        # 用expand广播，x: (..., seq_len, d_model), token_positions: (seq_len,)
+        token_positions = token_positions.expand(x.shape[:-1])  # (..., seq_len), (seq_len,)
+        # 或者
+        # token_positions = token_positions.unsqueeze(0).expand(x.shape[:-1]) # (..., seq_len), (1, seq_len)
+        x = x + self.mha(self.norm1(x), token_positions)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+@dataclass
+class TransformerLMConfig:
+    vocab_size: int
+    context_length: int
+    d_model: int
+    num_layers: int
+    num_heads: int
+    d_ff: int
+    rope_theta: float
+
+class TransformerLM(nn.Module):
+    def __init__(self, config: TransformerLMConfig):
+        super().__init__()
+        self.config = config
+        self.token_embeddings = Embedding(config.vocab_size, config.d_model)
+        transformer_block_config = TransformerBlockConfig(config.d_model, config.num_heads, config.d_ff, config.context_length, config.rope_theta)
+        self.layers = nn.ModuleList([TransformerBlock(transformer_block_config) for _ in range(config.num_layers)])
+        self.ln_final = RMSNorm(config.d_model)
+        self.lm_head = Linear(config.d_model, config.vocab_size)
+
+    def load_weights_dict(self, weights: dict[str, torch.Tensor]):
+        self.token_embeddings.W.data = weights["token_embeddings.weight"]
+        for i, layer in enumerate(self.layers):
+            prefix = f"layers.{i}."
+            layer.load_weights_dict(strip_prefix_from_state_dict(weights, prefix))
+        self.ln_final.weight.data = weights["ln_final.weight"]
+        self.lm_head.W.data = weights["lm_head.weight"]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.token_embeddings(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+        return self.lm_head(x)
