@@ -45,7 +45,7 @@ def test_train_bpe():
                 bytes([gpt2_byte_decoder[token] for token in merge_token_2]),
             )
             for merge_token_1, merge_token_2 in gpt2_reference_merges
-        ]
+        ]      
     assert merges == reference_merges
 
     # Compare the vocab to the expected output vocab

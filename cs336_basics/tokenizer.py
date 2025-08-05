@@ -1,5 +1,6 @@
 from abc import ABC
 from ctypes import addressof
+import heapq
 import os
 import json
 from dataclasses import dataclass
@@ -180,6 +181,44 @@ def process_chunk(args: tuple[str, list[str], int, int]) -> dict[bytes, int]:
         chunk = split_and_remove_special_tokens(chunk, special_tokens)
     return gpt2_pretokenize_to_freq_dict(chunk)
 
+class HeapItem:
+    def __init__(self, freq: int, pair: tuple[bytes, bytes]):
+        self.freq = freq
+        self.pair = pair
+
+    def __lt__(self, other: "HeapItem") -> bool:
+        if self.freq != other.freq:
+            return self.freq > other.freq
+        return self.pair > other.pair
+
+class FreqHeap:
+    """
+    A heap of pairs with their frequencies.
+    """
+    def __init__(self):
+        self.heap: list[HeapItem] = []
+        self.freq_dict: dict[tuple[bytes, bytes], int] = defaultdict(int)
+
+    def push(self, pair: tuple[bytes, bytes]):
+        freq = self.freq_dict.get(pair, 0)
+        heapq.heappush(self.heap, HeapItem(freq, pair))
+
+    def pop_max(self) -> tuple[bytes, bytes]:
+        """
+        返回value最大，key偏好lexicographically greater的pair，并从heap中删除。
+        如果返回的pair的freq在freq_dict中已经为小于-neg_freq，说明我们需要更新它同时更新heap，再重复取max
+        """
+        while self.heap:
+            item = heapq.heappop(self.heap)
+            current_freq = self.freq_dict.get(item.pair, 0)
+            if item.freq == current_freq and current_freq > 0:
+                return item.pair
+            elif current_freq > 0:
+                # 频率降低但仍有效，重新插入再取
+                heapq.heappush(self.heap, HeapItem(current_freq, item.pair))
+    # 否则当前_freq 为 0，表示已无效，跳过继续下一个
+        raise IndexError("Heap is empty or all frequencies are stale.")
+
 def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: list[str], **kwargs,) -> BPETokenizerParams:
     # 改进版本是不再操作原文本，而是操作一个哈希表，key是被特殊符号处理分割过的单词（还没登记到词表），value是该单词的频率
     # 这种方法把时间复杂度从 O(total byte) 降为 O(unique tokens)，对于大规模的文本数据，只要做好管理存储，也很便于维护新数据
@@ -214,7 +253,7 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
     num_merges = vocab_size - len(vocab) - len(special_tokens) # 目标词表大小减去初始字符数量和特殊符号数量
 
     # 4.1 计算词频
-    freq_dict: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
+    freq_heap: FreqHeap = FreqHeap()
     vocab_to_id: dict[bytes, int] = {}
 
     for pre_token, (id, freq) in data.items():
@@ -222,7 +261,7 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
         for i in range(len(pre_token) - 1):
             exist_token.add(pre_token[i])
             pair = (pre_token[i], pre_token[i + 1])
-            freq_dict[pair] += freq
+            freq_heap.freq_dict[pair] += freq
         exist_token.add(pre_token[len(pre_token) - 1]) # 加上最后一个词元
 
         for token in exist_token:
@@ -234,10 +273,14 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
                 vocab_to_id[token] = tuple(tmp)
             else:
                 vocab_to_id[token] = (id,)
+    
+    for pair, freq in freq_heap.freq_dict.items():
+        freq_heap.push(pair)
 
     while len(merges) < num_merges:
         # 4.1 计算词频
-        max_pair = lexicographically_greater_pair(freq_dict)
+        max_pair = freq_heap.pop_max()
+        new_freq_dict: dict[tuple[bytes, bytes], int] = defaultdict(int)
 
         # 4.2 更新merges和词表
         merges.append(max_pair)
@@ -269,11 +312,13 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
 
                 # 更新 freq_dict：先移除 candidate 中所有相邻 pair 的频率
                 for i in range(len(candidate) - 1):
-                    freq_dict[(candidate[i], candidate[i+1])] -= freq
+                    freq_heap.freq_dict[(candidate[i], candidate[i+1])] -= freq
 
                 # 更新 freq_dict：再为 new_token 添加新 pair 的频率
                 for i in range(len(new_token) - 1):
-                    freq_dict[(new_token[i], new_token[i+1])] += freq
+                    freq_heap.freq_dict[(new_token[i], new_token[i+1])] += freq
+                    if (new_token[i] == a + b or new_token[i+1] == a + b): 
+                        new_freq_dict[(new_token[i], new_token[i+1])] += freq
 
                 # 更新 vocab_to_id
                 if a+b in vocab_to_id:
@@ -291,6 +336,8 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
                 del data[candidate]
         # 现在我们有更新过后的data，freq_dict，vocab2pretoken
         # 可以开始下一轮了
+        for pair, freq in new_freq_dict.items():
+            freq_heap.push(pair)
         
     # 5. 补齐vocab里的特殊符号
     for special_token in special_tokens:
