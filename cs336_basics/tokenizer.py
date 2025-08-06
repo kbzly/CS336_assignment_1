@@ -206,7 +206,7 @@ class FreqHeap:
     def pop_max(self) -> tuple[bytes, bytes]:
         """
         返回value最大，key偏好lexicographically greater的pair，并从heap中删除。
-        如果返回的pair的freq在freq_dict中已经为小于-neg_freq，说明我们需要更新它同时更新heap，再重复取max
+        如果返回的pair的freq在freq_dict中已经为小于neg_freq，说明我们需要更新它同时更新heap，再重复取max
         """
         while self.heap:
             item = heapq.heappop(self.heap)
@@ -314,7 +314,7 @@ def train_bpe(input_path: str | os.PathLike, vocab_size: int, special_tokens: li
                 for i in range(len(candidate) - 1):
                     freq_heap.freq_dict[(candidate[i], candidate[i+1])] -= freq
 
-                # 更新 freq_dict：再为 new_token 添加新 pair 的频率
+                # 更新 freq_dict：再为 new_token 添加新      的频率
                 for i in range(len(new_token) - 1):
                     freq_heap.freq_dict[(new_token[i], new_token[i+1])] += freq
                     if (new_token[i] == a + b or new_token[i+1] == a + b): 
